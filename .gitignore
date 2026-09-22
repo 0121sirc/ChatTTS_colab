@@ -165,3 +165,5 @@ test_data/
 *.wav
 saved_seeds/
 models/
+# ChatTTS OpenAI TTS server runtime files
+.run/
