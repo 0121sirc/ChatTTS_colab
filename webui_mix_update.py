@@ -803,7 +803,10 @@ with gr.Blocks() as demo:
                 if seed_info:
                     character_seeds[character_name] = seed_info
                 else:
-                    missing_seeds.append(character_name)
+                    if int(character_name) > 0:
+                        character_seeds[character_name] = {"seed":int(character_name), "speed":5, "oral":1, "laugh":0, "break":2, "pt":""}
+                    else:
+                        missing_seeds.append(character_name)
 
             if missing_seeds:
                 missing_characters_str = ', '.join(missing_seeds)
@@ -924,8 +927,8 @@ with gr.Blocks() as demo:
                 # 默认数据 [speed_5][oral_2][laugh_0][break_4]
                 default_data = [
                     ["旁白", 1688, 3, 0, 0, 2, ""], # 女性，港台风格
-                    ["大虎妞",  -1, 5, 1, 0, 2, "./voice_pt/大虎妞.pt"], 
                     ["陈一发儿",  -1, 5, 1, 0, 2, "./voice_pt/陈一发儿.pt"], 
+                    ["大虎妞",  -1, 5, 1, 0, 2, "./voice_pt/大虎妞.pt"], 
                     ["甜腻女声",  2, 5, 1, 0, 2, ""], # 女性，甜美普通话
                     ["严肃女领导", -1, 5, 1, 0, 2, "./voice_pt/严肃女领导.pt"],
                     ["妞妞是坏蛋", -1, 5, 1, 0, 2, "./voice_pt/妞妞是坏蛋.pt"], 
