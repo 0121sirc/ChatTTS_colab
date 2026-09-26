@@ -167,3 +167,11 @@ saved_seeds/
 models/
 # ChatTTS OpenAI TTS server runtime files
 .run/
+
+# Local conda environment (prefix install)
+conda_env/
+.conda_env
+
+# Local runtime data
+output/
+voice_pt/
