@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# Control the ChatTTS OpenAI-compatible TTS server.
+# Control the ChatTTS Gradio WebUI (webui_mix_update.py).
 #
-# Used by speech-to-speech via:
-#   s2s.sh --tts-url http://127.0.0.1:${PORT:-8091}/v1
-#
-# Usage: openai_api_server.sh [start|stop|status] [--host HOST] [--port PORT]
-#   start   Launch the server in the background (default when no command is given)
+# Usage: webui.sh [start|stop|status] [--host HOST] [--port PORT] [--source SRC] [--local_path PATH]
+#   start   Launch the WebUI in the background (default when no command is given)
 #   stop    Gracefully stop it (TERM -> wait -> KILL)
-#   status  Report whether it is running and whether /v1/health responds
+#   status  Report whether it is running and whether the endpoint responds
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -29,11 +26,13 @@ default_host() {
 }
 
 HOST="${HOST:-$(default_host)}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-7860}"
+SOURCE="${SOURCE:-custom}"
+LOCAL_PATH="${LOCAL_PATH:-models}"
 PYTHON="$HERE/.conda_env/bin/python"
 RUN_DIR="$HERE/.run"
-PID_FILE="$RUN_DIR/openai_api_server.pid"
-LOG_FILE="$RUN_DIR/openai_api_server.log"
+PID_FILE="$RUN_DIR/webui.pid"
+LOG_FILE="$RUN_DIR/webui.log"
 
 # 0.0.0.0 is a bind address, not a dialable one.
 HEALTH_HOST="$HOST"
@@ -41,17 +40,19 @@ HEALTH_HOST="$HOST"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [start|stop|status] [--host HOST] [--port PORT]
+Usage: $(basename "$0") [start|stop|status] [--host HOST] [--port PORT] [--source SRC] [--local_path PATH]
 
-  start    Start the ChatTTS OpenAI-compatible TTS server in the background
-           (default). Waits until /v1/health is ready.
-  stop     Gracefully stop the server (TERM -> wait -> KILL fallback).
-  status   Show whether the server is running and healthy.
+  start    Start the ChatTTS Gradio WebUI in the background (default).
+           Waits until the HTTP endpoint is ready.
+  stop     Gracefully stop the WebUI (TERM -> wait -> KILL fallback).
+  status   Show whether the WebUI is running and its endpoint responds.
 
 Options:
-  --host HOST   Bind host (default: $HOST)
-  --port PORT   Bind port (default: $PORT)
-  -h, --help    Show this help
+  --host HOST        Bind host (default: $HOST)
+  --port PORT        Bind port (default: $PORT)
+  --source SRC       Model source: custom|huggingface (default: $SOURCE)
+  --local_path PATH  Local model path when --source custom (default: $LOCAL_PATH)
+  -h, --help         Show this help
 EOF
 }
 
@@ -63,7 +64,7 @@ is_running() {
 }
 
 health_ok() {
-  curl -fsS --max-time 3 --noproxy '*' "http://$HEALTH_HOST:$PORT/v1/health" >/dev/null 2>&1
+  curl -fsS --max-time 3 --noproxy '*' "http://$HEALTH_HOST:$PORT/" >/dev/null 2>&1
 }
 
 cmd_start() {
@@ -78,19 +79,20 @@ cmd_start() {
 
   mkdir -p "$RUN_DIR"
   : > "$LOG_FILE"
-  echo "Starting ChatTTS OpenAI TTS server on http://$HOST:$PORT ..."
-  nohup "$PYTHON" "$HERE/openai_tts_server.py" --host "$HOST" --port "$PORT" \
+  echo "Starting ChatTTS WebUI on http://$HOST:$PORT ..."
+  nohup "$PYTHON" "$HERE/webui_mix_update.py" \
+    --host "$HOST" --port "$PORT" --source "$SOURCE" --local_path "$LOCAL_PATH" \
     >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" > "$PID_FILE"
 
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 180); do
     if health_ok; then
       echo "Up (pid $pid). Log: $LOG_FILE"
       return 0
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
-      echo "ERROR: server exited during startup. Last log lines:" >&2
+      echo "ERROR: WebUI exited during startup. Last log lines:" >&2
       tail -20 "$LOG_FILE" >&2 || true
       rm -f "$PID_FILE"
       return 1
@@ -98,7 +100,7 @@ cmd_start() {
     sleep 1
   done
 
-  echo "WARNING: started (pid $pid) but /v1/health is not ready yet; see $LOG_FILE"
+  echo "WARNING: started (pid $pid) but the endpoint is not ready yet; see $LOG_FILE"
   return 0
 }
 
@@ -148,12 +150,14 @@ while [[ $# -gt 0 ]]; do
     start|stop|status) CMD="$1"; shift ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --source) SOURCE="$2"; shift 2 ;;
+    --local_path) LOCAL_PATH="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-# HEALTH_HOST/PORT may have changed via options.
+# HEALTH_HOST may have changed via options.
 HEALTH_HOST="$HOST"
 [[ "$HEALTH_HOST" == "0.0.0.0" ]] && HEALTH_HOST="127.0.0.1"
 
