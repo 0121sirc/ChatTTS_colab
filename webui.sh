@@ -67,6 +67,17 @@ health_ok() {
   curl -fsS --max-time 3 --noproxy '*' "http://$HEALTH_HOST:$PORT/" >/dev/null 2>&1
 }
 
+# True when something is listening on a TCP port -- catches a server that was
+# started by hand, since these scripts may bind a tailscale IP rather than
+# 127.0.0.1. Same helper as the CosyVoice/Qwen3-TTS launchers.
+#
+# health_ok() cannot tell our WebUI from a foreign process on the same port,
+# which would make the readiness loop report "Up" for a pid that never bound
+# the socket.
+port_listening() {
+  ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":$1$"
+}
+
 cmd_start() {
   if is_running; then
     if health_ok; then
@@ -75,6 +86,27 @@ cmd_start() {
     fi
     echo "Stale process $(cat "$PID_FILE") without a healthy endpoint; restarting."
     cmd_stop
+  fi
+
+  # .conda_env/ is gitignored (it *is* the conda env), so a fresh clone ships no
+  # interpreter at this path. Fail with the recipe instead of letting nohup die
+  # quietly in the log.
+  if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: Python interpreter not found at: $PYTHON" >&2
+    echo "  The conda env (.conda_env/) is not part of this checkout. Create it, then retry:" >&2
+    echo "      conda create -p .conda_env python=3.11 pip" >&2
+    echo "      .conda_env/bin/pip install -r requirements.txt" >&2
+    echo "  re-run: ./webui.sh start" >&2
+    return 1
+  fi
+
+  # Refuse to start when the port is already taken, otherwise health_ok() would
+  # answer for a process we did not start.
+  if port_listening "$PORT"; then
+    echo "ERROR: port $PORT is already in use; refusing to start a second WebUI." >&2
+    ss -tlnp "sport = :$PORT" 2>/dev/null | sed 's/^/    /' >&2 || true
+    echo "  stop the owner first: ./webui.sh stop" >&2
+    return 1
   fi
 
   mkdir -p "$RUN_DIR"
@@ -86,16 +118,18 @@ cmd_start() {
   local pid=$!
   echo "$pid" > "$PID_FILE"
 
+  # Liveness before health: a pid that never bound the socket must lose even if
+  # another process answers on this port.
   for _ in $(seq 1 180); do
-    if health_ok; then
-      echo "Up (pid $pid). Log: $LOG_FILE"
-      return 0
-    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "ERROR: WebUI exited during startup. Last log lines:" >&2
       tail -20 "$LOG_FILE" >&2 || true
       rm -f "$PID_FILE"
       return 1
+    fi
+    if health_ok; then
+      echo "Up (pid $pid). Log: $LOG_FILE"
+      return 0
     fi
     sleep 1
   done
