@@ -7,6 +7,7 @@ this repo's local weights (``models/``) and saved voices (``voice_pt/*.pt``).
 Endpoints:
   GET  /v1/health        -> readiness probe
   GET  /v1/audio/voices  -> {"voices": [...], "default": "seed:1688"}
+  GET  /v1/voices        -> identical body (alias; see the route below)
   POST /v1/audio/speech  -> raw PCM16 (default) or WAV
 
 Request body (OpenAI shape + two non-standard fields)::
@@ -30,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
+import unicodedata
 import wave
 from io import BytesIO
 from pathlib import Path
@@ -156,6 +159,110 @@ def _build_params(emb: torch.Tensor, req: "SpeechRequest") -> tuple[dict, dict, 
     return params_infer_code, params_refine_text, skip_refine_text
 
 
+# Text sanitation happens *before* ChatTTS sees the request. ChatTTS preprocesses
+# every string inside ChatTTS/core.py with
+#     WeTextProcessing normalization -> apply_half2full_map (half -> full width)
+#     -> count_invalid_characters -> apply_character_map -> homophones_replacer
+# and only then tokenizes it (models/asset/tokenizer.pt, vocab 21178, [UNK] = 100).
+# core.py:184 assigns homophones_replacer.replace(t), the *pre* character_map text,
+# so the character_map result is thrown away as soon as the homophones map loads -
+# and ChatTTS/res/homophones_map.json ships with the model, so it does load. What
+# the real chain does, measured with the shipped tokenizer:
+#   * `…`, `—` and the quotes are [UNK] (ASCII quotes go through half2full, `"` ->
+#     `“`), so `你—你再说一遍……` alone injects 4 of them: the deterministic noise.
+#   * `（）【】：；！＆＠＃～` reach the tokenizer verbatim, outside the whitelist the
+#     authors wrote for character_map -> the stray syllables.
+#   * WeTextProcessing verbalizes `+ = - : / % $ ℃ 25°C 1-2` on its own, but only
+#     when detect_language() sees Chinese; ASCII-only input takes the en path, where
+#     nemo_text_processing is missing, so that path normalizes nothing.
+# So this function keeps exactly what the normalizer and the tokenizer handle well
+# and folds the rest into `，。` or Chinese words. Its output alphabet (CJK, Latin,
+# digits, `，。、`, `,` `.` `?` `:` `%` `$` `€` `£` `¥` `/` `+` `=` `-` `℃` `°` and
+# whitespace) survives NFKC and apply_half2full_map unchanged, hence _sanitize is
+# idempotent and plain Chinese text comes through byte identical.
+#
+# Control tokens (`[uv_break]`, `[laugh]`, ...) belong to the caller, never to us.
+_CTRL_TOKEN = re.compile(r"(\[[A-Za-z_][A-Za-z0-9_]*\])")
+# Everything *not* in this class becomes a pause: alphanumerics, Chinese,
+# whitelisted punctuation and whatever WeTextProcessing verbalizes survive.
+_DROP_RE = re.compile(r"[^0-9A-Za-z一-鿿，。、？,.\s%$€£¥/+=:\-?℃°]")
+# `.` inside a run wins over a comma; a lone `.` is a decimal point and must stay.
+_RUN_PUNCT = re.compile(r"[,.，。?？]{2,}")
+# A colon between digits is a clock (`12:30` -> 十二点三十分), a stall anywhere
+# else, where it would otherwise reach the model as `：`.
+_COLON_RE = re.compile(r"(?<!\d):(?!\d)")
+# NFKC is only wanted on what WeTextProcessing reads as ASCII; these three would
+# come back worse (`℃` -> `°C`) or needlessly changed (`，` -> `,`).
+_FOLD_AWAY = str.maketrans({"℃": "\ue000", "，": "\ue001", "？": "\ue002"})
+_FOLD_BACK = str.maketrans({"\ue000": "℃", "\ue001": "，", "\ue002": "？"})
+
+# [UNK] sources: fold them before anything else sees them.
+_UNK_KILL = str.maketrans({
+    "…": "。", "‥": "。", "⋯": "。",
+    "—": ",", "–": ",", "―": ",", "‐": ",", "‑": ",", "‒": ",", "−": "-",
+    "‘": "", "’": "", "“": "", "”": "",
+})
+# Symbols the model reads unreliably -> the wording a human would read aloud.
+_SEMANTIC = str.maketrans({
+    "≈": "约", "≠": "不等于", "≤": "小于等于", "≥": "大于等于", "±": "正负",
+    "×": "乘", "÷": "除", "√": "根号", "∞": "无穷", "‰": "千分之",
+    "∝": "正比于", "∥": "平行于", "⊥": "垂直于", "∟": "垂直于",
+})
+# Quotes disappear: half2full turns `'` and `"` into `‘` and `“`, both [UNK]. An
+# opening bracket only ever adds a stall in front of its own content, the closing
+# one keeps the pause after it. `!` becomes `.` because `！` -> `。` is what
+# character_map was written to do for the authors - it just never gets the chance.
+_STRIP_MAP = str.maketrans({
+    "'": "", '"': "", "(": "", "[": "", "{": "",
+    "（": "", "【": "", "《": "", "「": "", "『": "", "〔": "", "〖": "",
+    "〘": "", "〚": "",
+})
+_PAUSE_MAP = str.maketrans({
+    ")": ",", "]": ",", "}": ",", "<": ",", ">": ",", ";": ",", "!": ".",
+    "）": ",", "】": ",", "》": ",", "」": ",", "』": ",", "〕": ",", "〗": ",",
+    "〙": ",", "〛": ",",
+})
+
+
+def _collapse_punct(match: "re.Match[str]") -> str:
+    """Keep the strongest mark of a run: a period beats a comma, `?` comes last."""
+    run = match.group()
+    if "." in run or "。" in run:
+        return "。"
+    if "?" in run or "？" in run:
+        return "?"
+    return ","
+
+
+def _sanitize_piece(text: str) -> str:
+    text = text.translate(_UNK_KILL)
+    text = text.translate(_SEMANTIC)
+    # fold full width ASCII, circled numerals and full width space into the ASCII
+    # shapes WeTextProcessing understands
+    text = unicodedata.normalize("NFKC", text.translate(_FOLD_AWAY)).translate(_FOLD_BACK)
+    text = text.translate(_STRIP_MAP)
+    text = text.translate(_PAUSE_MAP)
+    text = _COLON_RE.sub(",", text)
+    # anything the normalizer cannot verbalize should not reach the tokenizer
+    text = _DROP_RE.sub(",", text)
+    # repeated punctuation: a period wins over a comma, a lone `.` survives
+    text = _RUN_PUNCT.sub(_collapse_punct, text)
+    # a hanging comma at the end of the input only adds a stutter
+    return re.sub(r"[,，]+$", "。", text)
+
+
+def _sanitize(text: str) -> str:
+    """Fold symbols ChatTTS would otherwise read as noise. Keeps control tokens."""
+    if not text:
+        return text
+    parts = _CTRL_TOKEN.split(text)  # even indices are payload, odd are tokens
+    for index in range(0, len(parts), 2):
+        parts[index] = _sanitize_piece(parts[index])
+    out = "".join(parts)
+    # input that was only symbols still has to yield something speakable
+    return out if out.strip() else "。"
+
+
 def _split(text: str) -> list[str]:
     cleaned = replace_tokens(text)
     pieces = [restore_tokens(piece) for piece in split_text(cleaned, min_length=80)]
@@ -229,6 +336,11 @@ def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "model_loaded": _chat is not None, "sample_rate": SAMPLE_RATE})
 
 
+# OpenAI ships no voice-list endpoint at all; LocalAI documents
+# /v1/audio/voices, while ElevenLabs-style and most community
+# "OpenAI-compatible" clients guess /v1/voices. Serve one handler from both
+# paths (identical body) so their probe does not 404.
+@app.get("/v1/voices")
 @app.get("/v1/audio/voices")
 def voices() -> JSONResponse:
     names = sorted(path.stem for path in VOICE_DIR.glob("*.pt"))
@@ -240,6 +352,20 @@ def speech(req: SpeechRequest):
     text = (req.input or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty input")
+    # `params.sanitize=false` forwards the raw text, so an A/B against upstream
+    # behavior is possible without restarting the model.
+    if (req.params or {}).get("sanitize") is False:
+        clean = text
+    else:
+        clean = _sanitize(text)
+    if clean != text:
+        logger.info(
+            "text sanitized: %d -> %d chars (dropped %s, added %s)",
+            len(text), len(clean),
+            "".join(sorted(set(text) - set(clean)))[:60],
+            "".join(sorted(set(clean) - set(text)))[:60],
+        )
+    text = clean
 
     fmt = (req.response_format or "pcm").lower()
     if fmt not in {"pcm", "wav"}:
