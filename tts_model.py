@@ -12,17 +12,18 @@ import ChatTTS
 from config import DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K
 
 
-def load_chat_tts_model(source='huggingface', force_redownload=False, local_path=None):
+def load_chat_tts_model(source='huggingface', force_redownload=False, local_path=None, compile=False):
     """
     Load ChatTTS model
     :param source:
     :param force_redownload:
     :param local_path:
+    :param compile: torch.compile the GPT decoder (CUDA only, falls back on failure)
     :return:
     """
     print("Loading ChatTTS model...")
     chat = ChatTTS.Chat()
-    chat.load_models(source=source, force_redownload=force_redownload, custom_path=local_path, compile=False)
+    chat.load_models(source=source, force_redownload=force_redownload, custom_path=local_path, compile=compile)
     return chat
 
 

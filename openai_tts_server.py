@@ -33,11 +33,12 @@ import argparse
 import logging
 import re
 import sys
+import time
 import unicodedata
 import wave
 from io import BytesIO
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Iterator
 
 import numpy as np
@@ -51,6 +52,7 @@ sys.path.insert(0, str(HERE))
 
 import ChatTTS  # noqa: E402  (local package next to this file)
 from config import (  # noqa: E402
+    DEFAULT_BATCH_SIZE,
     DEFAULT_BK,
     DEFAULT_LAUGH,
     DEFAULT_ORAL,
@@ -60,7 +62,7 @@ from config import (  # noqa: E402
     DEFAULT_TOP_P,
 )
 from tts_model import deterministic, load_chat_tts_model  # noqa: E402
-from utils import replace_tokens, restore_tokens, split_text  # noqa: E402
+from utils import batch_split, replace_tokens, restore_tokens, split_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("chattts.openai")
@@ -75,6 +77,20 @@ app = FastAPI(title="ChatTTS OpenAI-compatible TTS")
 
 _chat: ChatTTS.Chat | None = None
 _load_lock = Lock()
+# Serializes GPU inference so the background warmup cannot run at the same time
+# as a real request (which would also clobber the deterministic RNG state).
+_infer_lock = Lock()
+
+
+def _raise_dynamo_cache_limit(limit: int = 64) -> None:
+    """Allow more per-shape graph variants before dynamo falls back to eager."""
+    try:
+        import torch._dynamo as dynamo
+    except Exception:  # pragma: no cover - very old torch
+        return
+    for attr in ("cache_size_limit", "recompile_limit"):
+        current = int(getattr(dynamo.config, attr, 0))
+        setattr(dynamo.config, attr, max(current, limit))
 
 
 def _ensure_loaded() -> "ChatTTS.Chat":
@@ -83,7 +99,11 @@ def _ensure_loaded() -> "ChatTTS.Chat":
         with _load_lock:
             if _chat is None:
                 logger.info("Loading ChatTTS models from %s", MODELS_DIR)
-                _chat = load_chat_tts_model(source="custom", local_path=str(MODELS_DIR))
+                _raise_dynamo_cache_limit()
+                # torch.compile the GPT decoder: ~1.5-2x on the token-by-token
+                # generation loop. It is a no-op unless the model landed on CUDA
+                # (see ChatTTS/core.py) and falls back to eager on failure.
+                _chat = load_chat_tts_model(source="custom", local_path=str(MODELS_DIR), compile=True)
                 logger.info("ChatTTS models loaded")
     return _chat
 
@@ -277,16 +297,20 @@ def _to_pcm16(audio: np.ndarray) -> np.ndarray:
 def _synth_full(text: str, infer_code: dict, refine_text: dict, skip_refine: bool) -> np.ndarray:
     chat = _ensure_loaded()
     parts: list[np.ndarray] = []
-    for piece in _split(text):
-        wavs = chat.infer(
-            [piece],
-            params_infer_code=dict(infer_code),
-            params_refine_text=dict(refine_text),
-            use_decoder=True,
-            skip_refine_text=skip_refine,
-        )
-        for wav in wavs:
-            parts.append(np.asarray(wav).reshape(-1))
+    pieces = _split(text)
+    # Feed a few pieces to chat.infer at once instead of one full generation
+    # loop per piece; the per-step overhead is shared across the batch.
+    with _infer_lock:
+        for batch in batch_split(pieces, DEFAULT_BATCH_SIZE):
+            wavs = chat.infer(
+                batch,
+                params_infer_code=dict(infer_code),
+                params_refine_text=dict(refine_text),
+                use_decoder=True,
+                skip_refine_text=skip_refine,
+            )
+            for wav in wavs:
+                parts.append(np.asarray(wav).reshape(-1))
     if not parts:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(parts)
@@ -319,6 +343,43 @@ def _wav_bytes(audio: np.ndarray) -> bytes:
         wav_file.setframerate(SAMPLE_RATE)
         wav_file.writeframes(pcm.tobytes())
     return buffer.getvalue()
+
+
+# torch.compile specializes the GPT decoder per input shape, and the batch
+# dimension is one of them: a request split into 1/2/3 pieces compiles its own
+# graph on first sight (tens of seconds). Warm every size real requests can use
+# at startup so the first user request does not pay for it.
+_WARMUP_LINE = "这是用于预热编译的测试文本"
+
+
+def _warmup_text(n_pieces: int) -> str:
+    # One paragraph per line; ``_split`` keeps the lines as separate pieces.
+    return "\n".join(f"{_WARMUP_LINE}{i}。" for i in range(n_pieces))
+
+
+def _warmup_batches(batches: tuple[int, ...]) -> None:
+    chat = _ensure_loaded()
+    device = next(chat.pretrain_models["gpt"].parameters()).device
+    if device.type != "cuda":
+        logger.info("warmup skipped: gpt is on %s, torch.compile is inactive", device)
+        return
+    try:
+        emb, _ = _resolve_speaker(None, None)
+        infer_code, refine_text, skip_refine = _build_params(emb, SpeechRequest(input=""))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("warmup skipped, could not build params: %s", exc)
+        return
+    for n in batches:
+        if n < 1:
+            continue
+        started = time.perf_counter()
+        try:
+            _synth_full(_warmup_text(n), infer_code, refine_text, skip_refine)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("warmup failed for batch size %d: %s", n, exc)
+            continue
+        logger.info("warmup batch size %d done in %.1fs", n, time.perf_counter() - started)
+    logger.info("warmup complete")
 
 
 class SpeechRequest(BaseModel):
@@ -388,9 +449,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ChatTTS OpenAI-compatible TTS server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument(
+        "--warmup",
+        dest="warmup",
+        action="store_true",
+        default=True,
+        help="pre-compile torch.compile shapes in the background (default)",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="skip the background warmup",
+    )
+    parser.add_argument(
+        "--warmup-batches",
+        default="1,2,3",
+        help="comma-separated piece-batch sizes to warm (default: 1,2,3)",
+    )
     args = parser.parse_args()
 
     _ensure_loaded()
+    if args.warmup:
+        batches = tuple(int(part) for part in args.warmup_batches.split(",") if part.strip().isdigit())
+        Thread(target=_warmup_batches, args=(batches,), name="chattts-warmup", daemon=True).start()
+        logger.info("warmup started for batch sizes %s", batches)
+    else:
+        logger.info("warmup disabled")
+
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, workers=1)
